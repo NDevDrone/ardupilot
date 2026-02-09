@@ -138,6 +138,21 @@ private:
     uint32_t _last_lat_acc_update_us;
     void _update_lat_acc_gain(const Vector2f &groundspeed);
 
+    // Optional lateral acceleration feedback around the inversion.
+    AP_Float _lat_acc_fb_p;
+    AP_Float _lat_acc_fb_i;
+    AP_Float _lat_acc_fb_d;
+    AP_Float _lat_acc_fb_tc;
+    bool _lat_acc_fb_enabled_prev = false;
+    float _lat_acc_fb_i_state = 0.0f;
+    float _lat_acc_fb_err_filt = 0.0f;
+    float _lat_acc_fb_err_filt_prev = 0.0f;
+    uint32_t _last_lat_acc_fb_update_us = 0;
+    float _lat_acc_fb_delta_roll_rad = 0.0f;
+    void _update_lat_acc_feedback(const Vector2f &groundspeed);
+    void _clear_lat_acc_feedback_state(void);
+    void _reset_lat_acc_feedback(void);
+
     // remember reached_loiter_target decision
     struct {
         uint32_t reached_loiter_target_ms;

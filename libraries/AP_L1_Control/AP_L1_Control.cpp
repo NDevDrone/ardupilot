@@ -47,6 +47,42 @@ const AP_Param::GroupInfo AP_L1_Control::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("LACC_K_TC",  4, AP_L1_Control, _lat_acc_k_tc, 4.0f),
 
+    // @Param: LACC_FB_P
+    // @DisplayName: Lateral acceleration feedback P gain
+    // @Description: Lateral acceleration feedback proportional gain. Set to zero to disable.
+    // @Units: 1
+    // @Range: 0 2
+    // @Increment: 0.05
+    // @User: Advanced
+    AP_GROUPINFO("LACC_FB_P",  5, AP_L1_Control, _lat_acc_fb_p, 0.0f),
+
+    // @Param: LACC_FB_I
+    // @DisplayName: Lateral acceleration feedback I gain
+    // @Description: Lateral acceleration feedback integral gain. Set to zero to disable.
+    // @Units: 1/s
+    // @Range: 0 1
+    // @Increment: 0.01
+    // @User: Advanced
+    AP_GROUPINFO("LACC_FB_I",  6, AP_L1_Control, _lat_acc_fb_i, 0.0f),
+
+    // @Param: LACC_FB_D
+    // @DisplayName: Lateral acceleration feedback D gain
+    // @Description: Lateral acceleration feedback derivative gain on filtered acceleration error. Set to zero to disable.
+    // @Units: s
+    // @Range: 0 0.5
+    // @Increment: 0.01
+    // @User: Advanced
+    AP_GROUPINFO("LACC_FB_D",  7, AP_L1_Control, _lat_acc_fb_d, 0.0f),
+
+    // @Param: LACC_FB_TC
+    // @DisplayName: Lateral acceleration feedback filter time constant
+    // @Description: Time constant for low-pass filtering lateral acceleration error. Set to zero to disable filtering.
+    // @Units: s
+    // @Range: 0 5
+    // @Increment: 0.05
+    // @User: Advanced
+    AP_GROUPINFO("LACC_FB_TC", 8, AP_L1_Control, _lat_acc_fb_tc, 0.5f),
+
     AP_GROUPEND
 };
 
@@ -101,7 +137,10 @@ int32_t AP_L1_Control::nav_roll_cd(void) const
 	*/
 	float pitchLimL1 = radians(60); // Suggestion: constraint may be modified to pitch limits if their absolute values are less than 90 degree and more than 60 degrees.
 	float pitchL1 = constrain_float(_ahrs.get_pitch_rad(),-pitchLimL1,pitchLimL1);
-    ret = degrees(atanf(_latAccDem * (1.0f/(GRAVITY_MSS * cosf(pitchL1) * _lat_acc_k)))) * 100.0f;
+    const float denom = GRAVITY_MSS * cosf(pitchL1) * _lat_acc_k;
+    const float phi_ff = atanf(_latAccDem * (1.0f / denom));
+    const float phi_cmd = phi_ff + _lat_acc_fb_delta_roll_rad;
+    ret = degrees(phi_cmd) * 100.0f;
     ret = constrain_float(ret, -9000, 9000);
     return ret;
 }
@@ -313,6 +352,124 @@ void AP_L1_Control::_update_lat_acc_gain(const Vector2f &groundspeed)
     _lat_acc_k = constrain_float(_lat_acc_k, 0.5f, 1.5f);
 }
 
+void AP_L1_Control::_clear_lat_acc_feedback_state(void)
+{
+    _lat_acc_fb_i_state = 0.0f;
+    _lat_acc_fb_err_filt = 0.0f;
+    _lat_acc_fb_err_filt_prev = 0.0f;
+    _lat_acc_fb_delta_roll_rad = 0.0f;
+}
+
+void AP_L1_Control::_reset_lat_acc_feedback(void)
+{
+    _clear_lat_acc_feedback_state();
+    _lat_acc_fb_enabled_prev = false;
+    _last_lat_acc_fb_update_us = 0;
+}
+
+void AP_L1_Control::_update_lat_acc_feedback(const Vector2f &groundspeed)
+{
+    const float p_gain = _lat_acc_fb_p.get();
+    const float i_gain = _lat_acc_fb_i.get();
+    const float d_gain = _lat_acc_fb_d.get();
+    const float fb_tc = _lat_acc_fb_tc.get();
+    const bool enabled = (p_gain > 0.0f) || (i_gain > 0.0f) || (d_gain > 0.0f);
+
+    if (!enabled) {
+        _reset_lat_acc_feedback();
+        return;
+    }
+
+    const uint32_t now_us = AP_HAL::micros();
+    if (!_lat_acc_fb_enabled_prev) {
+        _lat_acc_fb_enabled_prev = true;
+        _last_lat_acc_fb_update_us = now_us;
+        return;
+    }
+
+    const float dt = (now_us - _last_lat_acc_fb_update_us) * 1.0e-6f;
+    _last_lat_acc_fb_update_us = now_us;
+
+    // Require calling at a minimum of 5 Hz to operate.
+    if (!is_positive(dt) || dt > 0.2f) {
+        _clear_lat_acc_feedback_state();
+        return;
+    }
+
+    const float ground_speed_m_s = groundspeed.length();
+    const float min_groundspeed_m_s = MAX(_aparm.min_groundspeed.get(), 5.0f);
+    if (ground_speed_m_s < min_groundspeed_m_s) {
+        _clear_lat_acc_feedback_state();
+        return;
+    }
+
+    // Only apply feedback when guidance is commanding a meaningful turn.
+    if (fabsf(_latAccDem) < GRAVITY_MSS * tanf(radians(5.0f))) {
+        _clear_lat_acc_feedback_state();
+        return;
+    }
+
+    const Vector3f accel_ef = _ahrs.get_accel_ef();
+    const Vector2f track_lat_dir =
+        Vector2f(-groundspeed.y, groundspeed.x) * (1.0f / ground_speed_m_s);
+    const float measured_lat_accel_mss =
+        accel_ef.x * track_lat_dir.x + accel_ef.y * track_lat_dir.y;
+
+    // Map accel error to delta-roll around the inversion.
+    const float pitch_lim = radians(60.0f);
+    const float pitch_limited =
+        constrain_float(_ahrs.get_pitch_rad(), -pitch_lim, pitch_lim);
+    const float denom = GRAVITY_MSS * cosf(pitch_limited) * _lat_acc_k;
+    if (!is_positive(denom)) {
+        _clear_lat_acc_feedback_state();
+        return;
+    }
+
+    const float phi_ff = atanf(_latAccDem * (1.0f / denom));
+    const float sec2 = 1.0f + sq(tanf(phi_ff));
+
+    const float accel_error = _latAccDem - measured_lat_accel_mss;
+
+    // Low-pass filter accel error to avoid injecting roll chatter.
+    if (fb_tc > 0.0f) {
+        const float alpha = constrain_float(dt / (fb_tc + dt), 0.0f, 1.0f);
+        _lat_acc_fb_err_filt += alpha * (accel_error - _lat_acc_fb_err_filt);
+    } else {
+        _lat_acc_fb_err_filt = accel_error;
+    }
+
+    float accel_error_dot = 0.0f;
+    if (is_positive(dt)) {
+        accel_error_dot = (_lat_acc_fb_err_filt - _lat_acc_fb_err_filt_prev) * (1.0f / dt);
+    }
+    _lat_acc_fb_err_filt_prev = _lat_acc_fb_err_filt;
+    accel_error_dot = constrain_float(accel_error_dot, -30.0f, 30.0f);
+
+    // Integrate accel error (anti-windup applied after output limiting).
+    if (i_gain > 0.0f) {
+        _lat_acc_fb_i_state += _lat_acc_fb_err_filt * dt;
+        _lat_acc_fb_i_state = constrain_float(_lat_acc_fb_i_state, -20.0f, 20.0f);
+    } else {
+        _lat_acc_fb_i_state = 0.0f;
+    }
+
+    const float delta_accel = p_gain * _lat_acc_fb_err_filt +
+                              i_gain * _lat_acc_fb_i_state +
+                              d_gain * accel_error_dot;
+    float delta_phi = delta_accel * (1.0f / (denom * sec2));
+
+    const float delta_phi_limit = radians(15.0f);
+    const float unclamped_delta_phi = delta_phi;
+    delta_phi = constrain_float(delta_phi, -delta_phi_limit, delta_phi_limit);
+
+    if (i_gain > 0.0f && !is_equal(delta_phi, unclamped_delta_phi)) {
+        // Undo last integration step if saturated.
+        _lat_acc_fb_i_state -= _lat_acc_fb_err_filt * dt;
+    }
+
+    _lat_acc_fb_delta_roll_rad = delta_phi;
+}
+
 // update L1 control for waypoint navigation
 void AP_L1_Control::update_waypoint(const Location &prev_WP, const Location &next_WP, float dist_min)
 {
@@ -341,6 +498,7 @@ void AP_L1_Control::update_waypoint(const Location &prev_WP, const Location &nex
     if (_ahrs.get_location(_current_loc) == false) {
         // if no GPS loc available, maintain last nav/target_bearing
         _data_is_stale = true;
+        _reset_lat_acc_feedback();
         return;
     }
 
@@ -455,6 +613,7 @@ void AP_L1_Control::update_waypoint(const Location &prev_WP, const Location &nex
     _bearing_error = Nu; // bearing error angle (radians), +ve to left of track
 
     _update_lat_acc_gain(_groundspeed_vector);
+    _update_lat_acc_feedback(_groundspeed_vector);
 
     _data_is_stale = false; // status are correctly updated with current waypoint data
 }
@@ -482,6 +641,7 @@ void AP_L1_Control::update_loiter(const Location &center_WP, float radius, int8_
     if (_ahrs.get_location(_current_loc) == false) {
         // if no GPS loc available, maintain last nav/target_bearing
         _data_is_stale = true;
+        _reset_lat_acc_feedback();
         return;
     }
 
@@ -596,6 +756,7 @@ void AP_L1_Control::update_loiter(const Location &center_WP, float radius, int8_
     _last_loiter.center_WP = center_WP;
 
     _update_lat_acc_gain(_groundspeed_vector);
+    _update_lat_acc_feedback(_groundspeed_vector);
 
     _data_is_stale = false; // status are correctly updated with current waypoint data
 }
@@ -641,6 +802,7 @@ void AP_L1_Control::update_heading_hold(int32_t navigation_heading_cd)
     _latAccDem = 2.0f*sinf(Nu)*VomegaA;
 
     _update_lat_acc_gain(_groundspeed_vector);
+    _update_lat_acc_feedback(_groundspeed_vector);
 
     _data_is_stale = false; // status are correctly updated with current waypoint data
 }
@@ -659,6 +821,7 @@ void AP_L1_Control::update_level_flight(void)
     _last_loiter.reached_loiter_target_ms = 0;
 
     _latAccDem = 0;
+    _reset_lat_acc_feedback();
 
     _data_is_stale = false; // status are correctly updated with current waypoint data
 }
